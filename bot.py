@@ -47,7 +47,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     contact_url = os.getenv("CONTACT_URL", "")
     contact_hint = f"\n\nПрямая связь: {contact_url}" if contact_url else ""
     text = (
-        "Здравствуйте! Я бот-консультант по портфолио и услугам.\n\n"
+        "Здравствуйте! Я бот-консультант по услугам.\n\n"
         "Помогу быстро узнать об опыте, проектах, услугах и оставить заявку. "
         "Выберите раздел ниже или напишите вопрос сообщением."
         f"{contact_hint}"

@@ -6,10 +6,20 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+
+from database import (
+    add_cart_item,
+    add_dialog_message,
+    clear_dialog_history,
+    get_cart_items,
+    get_dialog_history as load_dialog_history,
+    initialize_database,
+    upsert_user,
+)
 
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
@@ -17,8 +27,8 @@ DEEPSEEK_MODEL = "deepseek-v4-flash"
 KNOWLEDGE_BASE_PATH = Path(__file__).with_name("KNOWLEDGE_BASE.md")
 CONTACT_TELEGRAM_URL = "https://t.me/kostik80_80"
 CONTACT_CALLBACK_DATA = "contact_human"
+ADD_TO_CART_CALLBACK_PREFIX = "add_to_cart:"
 MAX_HISTORY_MESSAGES = 10
-dialog_history: dict[tuple[int, int | None], list[dict[str, str]]] = {}
 KNOWLEDGE_BASE_ERROR_MESSAGE = (
     "Сейчас база знаний недоступна, поэтому я не могу подготовить точный ответ. "
     "Пожалуйста, попробуйте позже или свяжитесь напрямую."
@@ -45,65 +55,136 @@ SECURITY_REFUSAL_MESSAGE = (
 )
 
 
-MENU_TEXTS = {
-    "experience": (
-        "Опыт\n\n"
-        "Я помогаю потенциальным клиентам быстро понять, чем специалист может быть полезен: "
-        "рассказываю об опыте, подходе к работе, реализованных проектах и формате сотрудничества.\n\n"
-        "Каркас можно дополнить конкретными фактами: годы опыта, отрасли, стек, ключевые достижения."
-    ),
-    "projects": (
-        "Проекты\n\n"
-        "Здесь можно показать 3-5 сильных кейсов: задачу клиента, решение, результат и ссылку на портфолио.\n\n"
-        "Пример структуры кейса: проблема -> что сделали -> измеримый результат -> чем это полезно новому клиенту."
-    ),
-    "services": (
-        "Услуги\n\n"
-        "- Консультация и разбор задачи.\n"
-        "- Проектирование решения.\n"
-        "- Разработка Telegram-ботов и автоматизаций.\n"
-        "- Доработка существующих проектов.\n\n"
-        "Список услуг и цены лучше уточнить под реальное предложение владельца."
-    ),
-    "contacts": (
-        "Контакты и заявка\n\n"
-        "Напишите коротко, что нужно сделать, какой срок и как с вами связаться. "
-        "Бот подскажет, какие данные лучше отправить владельцу."
-    ),
+REPLY_MENU_ACTIONS = {
+    "Витрина": "showcase",
+    "Корзина": "cart",
+    "Связаться с человеком": "contact",
 }
 
 
-def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Опыт", callback_data="experience"), InlineKeyboardButton("Проекты", callback_data="projects")],
-            [InlineKeyboardButton("Услуги", callback_data="services"), InlineKeyboardButton("Контакты / заявка", callback_data="contacts")],
-            [InlineKeyboardButton("Связаться с человеком", callback_data=CONTACT_CALLBACK_DATA)],
-        ]
+def persistent_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [["Витрина", "Корзина"], ["Связаться с человеком"]],
+        resize_keyboard=True,
+        is_persistent=True,
     )
+
+
+def record_user_interaction(update: Update, started: bool = False) -> None:
+    """Persist the Telegram profile and last activity when it is available."""
+    user = update.effective_user
+    if user:
+        upsert_user(user.id, user.username, user.full_name, started=started)
+
+
+def save_dialog_entry(update: Update, role: str, content: str, include_in_context: bool = False) -> None:
+    key = get_dialog_key(update)
+    if key is not None:
+        add_dialog_message(key[0], key[1], role, content, include_in_context)
 
 
 def contact_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с человеком", callback_data=CONTACT_CALLBACK_DATA)]])
 
 
+def get_services() -> list[dict[str, str]]:
+    """Extract service names and prices from the «Цены и сроки» section of the knowledge base."""
+    knowledge_base = load_knowledge_base()
+    price_section = re.search(r"^## Цены и сроки\s*$([\s\S]*?)(?=^## |\Z)", knowledge_base, re.MULTILINE)
+    if not price_section:
+        return []
+
+    services = []
+    for line in price_section.group(1).splitlines():
+        match = re.match(r"\s*-\s*([^:]+):\s*(.*?)(?:,\s*[^,]+)?\s*$", line)
+        if not match:
+            continue
+        name, price = (part.strip() for part in match.groups())
+        services.append(
+            {
+                "name": name,
+                "description": "Описание услуги в базе знаний не указано.",
+                "price": price or "по запросу",
+            }
+        )
+    return services
+
+
+async def show_showcase(update: Update) -> None:
+    message = update.message
+    if not message:
+        return
+
+    try:
+        services = get_services()
+    except RuntimeError:
+        await message.reply_text(KNOWLEDGE_BASE_ERROR_MESSAGE)
+        return
+
+    if not services:
+        await message.reply_text("Сейчас витрина услуг уточняется. Пожалуйста, свяжитесь с человеком для консультации.")
+        return
+
+    showcase_heading = "Витрина услуг"
+    await message.reply_text(showcase_heading)
+    save_dialog_entry(update, "assistant", showcase_heading)
+    for index, service in enumerate(services):
+        text = (
+            f"{service['name']}\n\n"
+            f"{service['description']}\n\n"
+            f"Стоимость — {service['price']}"
+        )
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Добавить в корзину", callback_data=f"{ADD_TO_CART_CALLBACK_PREFIX}{index}")]]
+        )
+        await message.reply_text(text, reply_markup=keyboard)
+        save_dialog_entry(update, "assistant", text)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    record_user_interaction(update, started=True)
     contact_url = os.getenv("CONTACT_URL", "")
     contact_hint = f"\n\nПрямая связь: {contact_url}" if contact_url else ""
     text = (
         "Здравствуйте! Я бот-консультант по услугам.\n\n"
-        "Помогу быстро узнать об опыте, проектах, услугах и оставить заявку. "
-        "Выберите раздел ниже или напишите вопрос сообщением."
+        "Помогу ознакомиться с услугами и связаться с человеком.\n\n"
+        "Выберите нужный пункт в постоянном меню внизу или напишите вопрос сообщением."
         f"{contact_hint}"
     )
-    await update.message.reply_text(text, reply_markup=main_menu())
+    await update.message.reply_text(text, reply_markup=persistent_menu())
+    save_dialog_entry(update, "user", "/start")
+    save_dialog_entry(update, "assistant", text)
 
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    text = MENU_TEXTS.get(query.data, "Раздел не найден. Попробуйте выбрать пункт меню еще раз.")
-    await query.edit_message_text(text=text, reply_markup=main_menu())
+async def reply_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+
+    record_user_interaction(update)
+    save_dialog_entry(update, "user", update.message.text)
+    action = REPLY_MENU_ACTIONS[update.message.text]
+    if action == "showcase":
+        await show_showcase(update)
+        return
+
+    if action == "cart":
+        user_id = update.effective_user.id if update.effective_user else None
+        saved_services = get_cart_items(user_id) if user_id is not None else []
+        if saved_services:
+            items = "\n".join(
+                f"• {item['service_name']} — {item['quantity']} шт. ({item['service_price']})"
+                for item in saved_services
+            )
+            response = f"Ваша корзина:\n{items}"
+        else:
+            response = "Корзина пока пуста. Добавьте услугу из витрины."
+        await update.message.reply_text(response)
+        save_dialog_entry(update, "assistant", response)
+        return
+
+    await send_contact_information(update, context, update.message)
 
 
 def get_admin_chat_id() -> int | None:
@@ -119,10 +200,7 @@ def get_admin_chat_id() -> int | None:
         return None
 
 
-async def contact_human_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
+async def send_contact_information(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_message) -> None:
     user = update.effective_user
     if user:
         name = user.full_name or "Без имени"
@@ -141,25 +219,66 @@ async def contact_human_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as error:
             logging.exception("Не удалось отправить уведомление владельцу: %s", error)
 
-    await query.message.reply_text(
+    response = (
         "Можно связаться с владельцем напрямую в Telegram:\n"
         f"{CONTACT_TELEGRAM_URL}"
     )
+    await reply_message.reply_text(response)
+    save_dialog_entry(update, "assistant", response)
+
+
+async def contact_human_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    record_user_interaction(update)
+    save_dialog_entry(update, "user", "Связаться с человеком")
+    await send_contact_information(update, context, query.message)
+
+
+async def add_to_cart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not query.data or not update.effective_user:
+        return
+
+    record_user_interaction(update)
+
+    try:
+        service_index = int(query.data.removeprefix(ADD_TO_CART_CALLBACK_PREFIX))
+        service = get_services()[service_index]
+    except (IndexError, ValueError, RuntimeError):
+        await query.message.reply_text("Не удалось определить услугу. Пожалуйста, откройте витрину ещё раз.")
+        return
+
+    quantity = add_cart_item(update.effective_user.id, service)
+    save_dialog_entry(update, "user", f"Добавить в корзину: {service['name']}")
+    response = f"Услуга «{service['name']}» добавлена в корзину. Количество: {quantity}."
+    await query.message.reply_text(response)
+    save_dialog_entry(update, "assistant", response)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    if not update.message:
+        return
+    record_user_interaction(update)
+    response = (
         "Доступные команды:\n"
         "/start — открыть меню бота\n"
         "/help — показать помощь\n"
         "/reset — очистить память диалога\n\n"
         "Также можно написать вопрос обычным сообщением."
     )
+    await update.message.reply_text(response)
+    save_dialog_entry(update, "user", "/help")
+    save_dialog_entry(update, "assistant", response)
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    dialog_history.pop(get_dialog_key(update), None)
-    await update.message.reply_text("Память диалога очищена. Можно начать заново.", reply_markup=main_menu())
+    record_user_interaction(update)
+    key = get_dialog_key(update)
+    if key is not None:
+        clear_dialog_history(*key)
+    await update.message.reply_text("Память диалога очищена. Можно начать заново.", reply_markup=persistent_menu())
 
 
 def load_knowledge_base() -> str:
@@ -218,22 +337,12 @@ def get_dialog_history(update: Update) -> list[dict[str, str]]:
     if key is None:
         return []
 
-    return dialog_history.get(key, []).copy()
+    return load_dialog_history(*key, MAX_HISTORY_MESSAGES)
 
 
 def add_to_dialog_history(update: Update, question: str, answer: str) -> None:
-    key = get_dialog_key(update)
-    if key is None:
-        return
-
-    history = dialog_history.setdefault(key, [])
-    history.extend(
-        [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer},
-        ]
-    )
-    del history[:-MAX_HISTORY_MESSAGES]
+    save_dialog_entry(update, "user", question, include_in_context=True)
+    save_dialog_entry(update, "assistant", answer, include_in_context=True)
 
 
 async def ask_deepseek(question: str, history: list[dict[str, str]] | None = None) -> str:
@@ -290,11 +399,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.message.text:
         return
 
+    record_user_interaction(update)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     guardrail_refusal = get_guardrail_refusal(update.message.text)
     if guardrail_refusal:
         await update.message.reply_text(guardrail_refusal, reply_markup=contact_keyboard())
+        add_to_dialog_history(update, update.message.text, guardrail_refusal)
         return
 
     try:
@@ -302,22 +413,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except RuntimeError as error:
         logging.warning("Ошибка конфигурации Deepseek: %s", error)
         if "KNOWLEDGE_BASE.md" in str(error):
-            await update.message.reply_text(KNOWLEDGE_BASE_ERROR_MESSAGE)
+            response = KNOWLEDGE_BASE_ERROR_MESSAGE
         else:
-            await update.message.reply_text("Сейчас ответы ИИ не настроены. Проверьте переменную DEEPSEEK_API_KEY в окружении.")
+            response = "Сейчас ответы ИИ не настроены. Проверьте переменную DEEPSEEK_API_KEY в окружении."
+        await update.message.reply_text(response)
+        add_to_dialog_history(update, update.message.text, response)
     except (httpx.HTTPError, KeyError, IndexError, TypeError) as error:
         logging.exception("Ошибка при обращении к Deepseek API: %s", error)
-        await update.message.reply_text("Не удалось получить ответ от ИИ. Попробуйте повторить запрос чуть позже.")
+        response = "Не удалось получить ответ от ИИ. Попробуйте повторить запрос чуть позже."
+        await update.message.reply_text(response)
+        add_to_dialog_history(update, update.message.text, response)
     else:
         if answer:
             await reply_deepseek_answer(update, answer)
             add_to_dialog_history(update, update.message.text, answer)
         else:
-            await update.message.reply_text("ИИ вернул пустой ответ. Попробуйте переформулировать вопрос.")
+            response = "ИИ вернул пустой ответ. Попробуйте переформулировать вопрос."
+            await update.message.reply_text(response)
+            add_to_dialog_history(update, update.message.text, response)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log polling and update errors without exposing configuration values."""
+    if isinstance(context.error, Conflict):
+        logging.error(
+            "Telegram отклонил polling: для этого бота уже выполняется другой getUpdates-запрос. "
+            "Остановите другой экземпляр бота или отключите его webhook, затем перезапустите только этот экземпляр."
+        )
+        return
+
+    logging.error("Необработанная ошибка Telegram-бота.", exc_info=context.error)
 
 
 def build_application() -> Application:
     load_dotenv()
+    initialize_database()
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN. Создайте .env по примеру .env.example или задайте переменную окружения.")
@@ -327,8 +457,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CallbackQueryHandler(contact_human_callback, pattern=f"^{CONTACT_CALLBACK_DATA}$"))
-    application.add_handler(CallbackQueryHandler(menu_callback))
+    application.add_handler(CallbackQueryHandler(add_to_cart_callback, pattern=f"^{re.escape(ADD_TO_CART_CALLBACK_PREFIX)}"))
+    application.add_handler(MessageHandler(filters.Regex(f"^({'|'.join(map(re.escape, REPLY_MENU_ACTIONS))})$"), reply_menu_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(error_handler)
     return application
 
 

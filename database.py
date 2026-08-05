@@ -1,8 +1,11 @@
 """SQLite storage for the bot's durable user data and conversation context."""
 
 import sqlite3
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from typing import Iterator
 
@@ -140,6 +143,11 @@ def add_cart_item(telegram_user_id: int, service: dict[str, str]) -> int:
     return int(row["quantity"])
 
 
+def _cart_item_token(service_name: str) -> str:
+    """Return a compact stable identifier suitable for Telegram callback data."""
+    return sha256(service_name.encode("utf-8")).hexdigest()[:16]
+
+
 def get_cart_items(telegram_user_id: int) -> list[dict[str, str | int]]:
     with _connection() as connection:
         rows = connection.execute(
@@ -149,11 +157,45 @@ def get_cart_items(telegram_user_id: int) -> list[dict[str, str | int]]:
             """,
             (telegram_user_id,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [{**dict(row), "token": _cart_item_token(row["service_name"])} for row in rows]
 
 
-def create_draft_order_from_cart(telegram_user_id: int) -> int | None:
-    """Snapshot the current cart into an unpaid draft order for a future checkout flow."""
+def remove_cart_item(telegram_user_id: int, item_token: str) -> bool:
+    """Remove one unit of a cart item identified by its callback-safe token."""
+    with _connection() as connection:
+        items = connection.execute(
+            "SELECT service_name, quantity FROM cart_items WHERE telegram_user_id = ?", (telegram_user_id,)
+        ).fetchall()
+        item = next((row for row in items if _cart_item_token(row["service_name"]) == item_token), None)
+        if item is None:
+            return False
+
+        if item["quantity"] == 1:
+            connection.execute(
+                "DELETE FROM cart_items WHERE telegram_user_id = ? AND service_name = ?",
+                (telegram_user_id, item["service_name"]),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE cart_items SET quantity = quantity - 1, updated_at = ?
+                WHERE telegram_user_id = ? AND service_name = ?
+                """,
+                (_utc_now(), telegram_user_id, item["service_name"]),
+            )
+    return True
+
+
+def _price_amount(price: str) -> tuple[Decimal | None, bool]:
+    """Extract a ruble amount and whether it is a lower-bound price (``от``)."""
+    match = re.search(r"\d[\d\s]*", price)
+    if not match:
+        return None, False
+    return Decimal(match.group().replace(" ", "")), "от" in price.lower()
+
+
+def checkout_cart(telegram_user_id: int) -> dict[str, object] | None:
+    """Atomically create a pending-payment order from the cart and clear it."""
     now = _utc_now()
     with _connection() as connection:
         cart_items = connection.execute(
@@ -166,12 +208,21 @@ def create_draft_order_from_cart(telegram_user_id: int) -> int | None:
         if not cart_items:
             return None
 
+        amounts = [_price_amount(item["service_price"]) for item in cart_items]
+        total_amount = sum(
+            (amount * item["quantity"] for item, (amount, _) in zip(cart_items, amounts) if amount is not None),
+            Decimal("0"),
+        )
+        has_unknown_price = any(amount is None for amount, _ in amounts)
+        has_lower_bound = any(is_lower_bound for _, is_lower_bound in amounts)
+        stored_total = None if has_unknown_price else str(total_amount)
+
         cursor = connection.execute(
             """
-            INSERT INTO orders (telegram_user_id, status, created_at, updated_at)
-            VALUES (?, 'draft', ?, ?)
+            INSERT INTO orders (telegram_user_id, status, total_amount, currency, created_at, updated_at)
+            VALUES (?, 'ожидает оплаты', ?, 'RUB', ?, ?)
             """,
-            (telegram_user_id, now, now),
+            (telegram_user_id, stored_total, now, now),
         )
         order_id = int(cursor.lastrowid)
         connection.executemany(
@@ -184,7 +235,14 @@ def create_draft_order_from_cart(telegram_user_id: int) -> int | None:
                 for item in cart_items
             ],
         )
-    return order_id
+        connection.execute("DELETE FROM cart_items WHERE telegram_user_id = ?", (telegram_user_id,))
+
+    return {
+        "id": order_id,
+        "items": [dict(item) for item in cart_items],
+        "total_amount": total_amount if not has_unknown_price else None,
+        "is_lower_bound": has_lower_bound,
+    }
 
 
 def update_order_status(order_id: int, status: str, payment_reference: str | None = None) -> None:

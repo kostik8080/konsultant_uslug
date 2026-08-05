@@ -14,10 +14,12 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from database import (
     add_cart_item,
     add_dialog_message,
+    checkout_cart,
     clear_dialog_history,
     get_cart_items,
     get_dialog_history as load_dialog_history,
     initialize_database,
+    remove_cart_item,
     upsert_user,
 )
 
@@ -28,6 +30,8 @@ KNOWLEDGE_BASE_PATH = Path(__file__).with_name("KNOWLEDGE_BASE.md")
 CONTACT_TELEGRAM_URL = "https://t.me/kostik80_80"
 CONTACT_CALLBACK_DATA = "contact_human"
 ADD_TO_CART_CALLBACK_PREFIX = "add_to_cart:"
+REMOVE_CART_ITEM_CALLBACK_PREFIX = "remove_cart:"
+CHECKOUT_CALLBACK_DATA = "checkout_cart"
 MAX_HISTORY_MESSAGES = 10
 KNOWLEDGE_BASE_ERROR_MESSAGE = (
     "Сейчас база знаний недоступна, поэтому я не могу подготовить точный ответ. "
@@ -85,6 +89,51 @@ def save_dialog_entry(update: Update, role: str, content: str, include_in_contex
 
 def contact_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с человеком", callback_data=CONTACT_CALLBACK_DATA)]])
+
+
+def format_ruble_amount(amount) -> str:
+    return f"{int(amount):,}".replace(",", " ") + " ₽"
+
+
+def cart_text_and_keyboard(items: list[dict[str, str | int]]) -> tuple[str, InlineKeyboardMarkup | None]:
+    if not items:
+        return "Корзина пока пуста. Откройте «Витрину», чтобы добавить услугу.", None
+
+    lines = ["Ваша корзина:"]
+    keyboard = []
+    total = 0
+    has_unknown_price = False
+    has_lower_bound = False
+    for item in items:
+        quantity = int(item["quantity"])
+        price = str(item["service_price"])
+        lines.append(f"• {item['service_name']} — {quantity} шт. × {price}")
+        price_digits = re.search(r"\d[\d\s]*", price)
+        if price_digits:
+            total += int(price_digits.group().replace(" ", "")) * quantity
+            has_lower_bound = has_lower_bound or "от" in price.lower()
+        else:
+            has_unknown_price = True
+        keyboard.append(
+            [InlineKeyboardButton(f"Убрать: {item['service_name']}", callback_data=f"{REMOVE_CART_ITEM_CALLBACK_PREFIX}{item['token']}")]
+        )
+
+    if has_unknown_price:
+        lines.append("\nИтого: стоимость уточняется по запросу.")
+    else:
+        prefix = "от " if has_lower_bound else ""
+        lines.append(f"\nИтого: {prefix}{format_ruble_amount(total)}")
+    keyboard.append([InlineKeyboardButton("Оформить заказ", callback_data=CHECKOUT_CALLBACK_DATA)])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def update_cart_message(query, text: str, keyboard: InlineKeyboardMarkup | None) -> None:
+    """Update an inline cart view; old or already-current Telegram messages are harmless."""
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except BadRequest as error:
+        if "Message is not modified" not in str(error):
+            logging.info("Не удалось обновить старое сообщение корзины: %s", error)
 
 
 def get_services() -> list[dict[str, str]]:
@@ -172,15 +221,8 @@ async def reply_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "cart":
         user_id = update.effective_user.id if update.effective_user else None
         saved_services = get_cart_items(user_id) if user_id is not None else []
-        if saved_services:
-            items = "\n".join(
-                f"• {item['service_name']} — {item['quantity']} шт. ({item['service_price']})"
-                for item in saved_services
-            )
-            response = f"Ваша корзина:\n{items}"
-        else:
-            response = "Корзина пока пуста. Добавьте услугу из витрины."
-        await update.message.reply_text(response)
+        response, keyboard = cart_text_and_keyboard(saved_services)
+        await update.message.reply_text(response, reply_markup=keyboard)
         save_dialog_entry(update, "assistant", response)
         return
 
@@ -252,8 +294,59 @@ async def add_to_cart_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     quantity = add_cart_item(update.effective_user.id, service)
     save_dialog_entry(update, "user", f"Добавить в корзину: {service['name']}")
-    response = f"Услуга «{service['name']}» добавлена в корзину. Количество: {quantity}."
+    response = f"Услуга «{service['name']}» добавлена в корзину. В корзине: {quantity} шт."
     await query.message.reply_text(response)
+    save_dialog_entry(update, "assistant", response)
+
+
+async def remove_cart_item_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query.data or not update.effective_user:
+        await query.answer()
+        return
+
+    record_user_interaction(update)
+    item_token = query.data.removeprefix(REMOVE_CART_ITEM_CALLBACK_PREFIX)
+    removed = remove_cart_item(update.effective_user.id, item_token)
+    await query.answer(None if removed else "Эта позиция уже удалена. Корзина актуализирована.")
+    items = get_cart_items(update.effective_user.id)
+    response, keyboard = cart_text_and_keyboard(items)
+    await update_cart_message(query, response, keyboard)
+
+
+async def checkout_cart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not update.effective_user:
+        await query.answer()
+        return
+
+    record_user_interaction(update)
+    order = checkout_cart(update.effective_user.id)
+    if order is None:
+        await query.answer("Корзина уже пуста. Откройте витрину, чтобы добавить услугу.")
+        response, keyboard = cart_text_and_keyboard([])
+        await update_cart_message(query, response, keyboard)
+        return
+
+    await query.answer()
+
+    item_lines = "\n".join(
+        f"• {item['service_name']} — {item['quantity']} шт. × {item['service_price']}"
+        for item in order["items"]
+    )
+    if order["total_amount"] is None:
+        total = "Стоимость будет уточнена отдельно."
+    else:
+        prefix = "от " if order["is_lower_bound"] else ""
+        total = f"Итого: {prefix}{format_ruble_amount(order['total_amount'])}."
+    response = (
+        f"Заказ №{order['id']} оформлен и ожидает оплаты.\n\n"
+        f"Состав заказа:\n{item_lines}\n\n{total}\n\n"
+        "Онлайн-оплата появится позже; сейчас мы не принимаем оплату в боте."
+    )
+    await update_cart_message(query, "Корзина оформлена и теперь пуста.", None)
+    await query.message.reply_text(response)
+    save_dialog_entry(update, "user", "Оформить заказ")
     save_dialog_entry(update, "assistant", response)
 
 
@@ -458,6 +551,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CallbackQueryHandler(contact_human_callback, pattern=f"^{CONTACT_CALLBACK_DATA}$"))
     application.add_handler(CallbackQueryHandler(add_to_cart_callback, pattern=f"^{re.escape(ADD_TO_CART_CALLBACK_PREFIX)}"))
+    application.add_handler(CallbackQueryHandler(remove_cart_item_callback, pattern=f"^{re.escape(REMOVE_CART_ITEM_CALLBACK_PREFIX)}"))
+    application.add_handler(CallbackQueryHandler(checkout_cart_callback, pattern=f"^{CHECKOUT_CALLBACK_DATA}$"))
     application.add_handler(MessageHandler(filters.Regex(f"^({'|'.join(map(re.escape, REPLY_MENU_ACTIONS))})$"), reply_menu_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)

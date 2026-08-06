@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from decimal import Decimal, InvalidOperation
 from html import escape
 from pathlib import Path
 
@@ -18,8 +19,11 @@ from database import (
     clear_dialog_history,
     get_cart_items,
     get_dialog_history as load_dialog_history,
+    get_order,
     initialize_database,
+    mark_order_paid,
     remove_cart_item,
+    save_payment_session,
     upsert_user,
 )
 
@@ -32,6 +36,9 @@ CONTACT_CALLBACK_DATA = "contact_human"
 ADD_TO_CART_CALLBACK_PREFIX = "add_to_cart:"
 REMOVE_CART_ITEM_CALLBACK_PREFIX = "remove_cart:"
 CHECKOUT_CALLBACK_DATA = "checkout_cart"
+PAY_ORDER_CALLBACK_PREFIX = "pay_order:"
+CHECK_PAYMENT_CALLBACK_PREFIX = "check_payment:"
+STRIPE_API_URL = "https://api.stripe.com/v1/checkout/sessions"
 MAX_HISTORY_MESSAGES = 10
 KNOWLEDGE_BASE_ERROR_MESSAGE = (
     "Сейчас база знаний недоступна, поэтому я не могу подготовить точный ответ. "
@@ -93,6 +100,17 @@ def contact_keyboard() -> InlineKeyboardMarkup:
 
 def format_ruble_amount(amount) -> str:
     return f"{int(amount):,}".replace(",", " ") + " ₽"
+
+
+def payment_keyboard(order_id: int, payment_url: str | None = None) -> InlineKeyboardMarkup:
+    if payment_url:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Перейти к оплате", url=payment_url)],
+                [InlineKeyboardButton("Я оплатил", callback_data=f"{CHECK_PAYMENT_CALLBACK_PREFIX}{order_id}")],
+            ]
+        )
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Оплатить", callback_data=f"{PAY_ORDER_CALLBACK_PREFIX}{order_id}")]])
 
 
 def cart_text_and_keyboard(items: list[dict[str, str | int]]) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -342,12 +360,170 @@ async def checkout_cart_callback(update: Update, context: ContextTypes.DEFAULT_T
     response = (
         f"Заказ №{order['id']} оформлен и ожидает оплаты.\n\n"
         f"Состав заказа:\n{item_lines}\n\n{total}\n\n"
-        "Онлайн-оплата появится позже; сейчас мы не принимаем оплату в боте."
+        "Нажмите «Оплатить», чтобы получить ссылку на безопасную страницу оплаты."
     )
     await update_cart_message(query, "Корзина оформлена и теперь пуста.", None)
-    await query.message.reply_text(response)
+    keyboard = payment_keyboard(order["id"]) if order["total_amount"] is not None else None
+    await query.message.reply_text(response, reply_markup=keyboard)
     save_dialog_entry(update, "user", "Оформить заказ")
     save_dialog_entry(update, "assistant", response)
+
+
+def get_stripe_key() -> str:
+    """Read the server-side Stripe test key without ever exposing it to users."""
+    api_key = os.getenv("SCRIPE_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Не задан SCRIPE_KEY.")
+    return api_key
+
+
+async def create_stripe_checkout_session(order: dict[str, object]) -> tuple[str, str]:
+    """Create an idempotent Stripe Checkout Session for one stored order."""
+    amount = order["total_amount"]
+    if amount is None:
+        raise ValueError("У заказа не определена сумма.")
+
+    try:
+        amount_in_kopecks = int(Decimal(str(amount)) * 100)
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError("Сумма заказа имеет неверный формат.") from error
+    if amount_in_kopecks <= 0:
+        raise ValueError("Сумма заказа должна быть больше нуля.")
+
+    order_id = int(order["id"])
+    payload = {
+        "mode": "payment",
+        "success_url": "https://t.me/",
+        "cancel_url": "https://t.me/",
+        "client_reference_id": str(order_id),
+        "metadata[order_id]": str(order_id),
+        "line_items[0][quantity]": "1",
+        "line_items[0][price_data][currency]": "rub",
+        "line_items[0][price_data][unit_amount]": str(amount_in_kopecks),
+        "line_items[0][price_data][product_data][name]": f"Заказ №{order_id}",
+        "line_items[0][price_data][product_data][description]": f"Оплата заказа №{order_id}",
+    }
+    headers = {"Idempotency-Key": f"telegram-order-{order_id}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(STRIPE_API_URL, auth=(get_stripe_key(), ""), headers=headers, data=payload)
+        response.raise_for_status()
+
+    session = response.json()
+    session_id, payment_url = session.get("id"), session.get("url")
+    if not isinstance(session_id, str) or not isinstance(payment_url, str):
+        raise ValueError("Stripe вернул неполные данные платёжной сессии.")
+    return session_id, payment_url
+
+
+async def pay_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query.data or not update.effective_user:
+        await query.answer()
+        return
+
+    record_user_interaction(update)
+    try:
+        order_id = int(query.data.removeprefix(PAY_ORDER_CALLBACK_PREFIX))
+    except ValueError:
+        await query.answer("Не удалось определить заказ.")
+        return
+
+    order = get_order(order_id, update.effective_user.id)
+    if order is None:
+        await query.answer("Заказ не найден.")
+        return
+    if order["status"] == "оплачен":
+        await query.answer("Этот заказ уже оплачен.")
+        return
+    if order["payment_url"]:
+        await query.answer()
+        await query.message.reply_text(
+            "Ссылка на оплату уже создана.",
+            reply_markup=payment_keyboard(order_id, str(order["payment_url"])),
+        )
+        return
+    if order["total_amount"] is None:
+        await query.answer("Для этого заказа сумма пока не определена.")
+        return
+
+    await query.answer("Создаю ссылку на оплату…")
+    try:
+        payment_reference, payment_url = await create_stripe_checkout_session(order)
+        saved_order = save_payment_session(order_id, payment_reference, payment_url)
+    except (RuntimeError, ValueError, httpx.HTTPError) as error:
+        logging.exception("Не удалось создать платёж Stripe для заказа №%s: %s", order_id, error)
+        await query.message.reply_text("Не удалось создать ссылку на оплату. Попробуйте чуть позже.")
+        return
+
+    if not saved_order or not saved_order["payment_url"]:
+        await query.message.reply_text("Не удалось сохранить платёж. Попробуйте чуть позже.")
+        return
+    await query.message.reply_text(
+        f"Оплатите заказ №{order_id} по ссылке, затем вернитесь сюда и нажмите «Я оплатил».",
+        reply_markup=payment_keyboard(order_id, str(saved_order["payment_url"])),
+    )
+
+
+async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query.data or not update.effective_user:
+        await query.answer()
+        return
+
+    try:
+        order_id = int(query.data.removeprefix(CHECK_PAYMENT_CALLBACK_PREFIX))
+    except ValueError:
+        await query.answer("Не удалось определить заказ.")
+        return
+
+    order = get_order(order_id, update.effective_user.id)
+    if order is None:
+        await query.answer("Заказ не найден.")
+        return
+    if order["status"] == "оплачен":
+        await query.answer("Этот заказ уже оплачен.")
+        return
+    if not order["payment_reference"]:
+        await query.answer("Сначала нажмите «Оплатить», чтобы получить ссылку.")
+        return
+
+    await query.answer("Проверяю оплату…")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{STRIPE_API_URL}/{order['payment_reference']}", auth=(get_stripe_key(), "")
+            )
+            response.raise_for_status()
+        paid = response.json().get("payment_status") == "paid"
+    except (RuntimeError, httpx.HTTPError, ValueError) as error:
+        logging.exception("Не удалось проверить платёж Stripe для заказа №%s: %s", order_id, error)
+        await query.message.reply_text("Не удалось проверить оплату. Попробуйте чуть позже.")
+        return
+
+    if not paid:
+        await query.message.reply_text(
+            "Оплата пока не подтверждена. Завершите её по ссылке и затем нажмите «Я оплатил» ещё раз.",
+            reply_markup=payment_keyboard(order_id, str(order["payment_url"])),
+        )
+        return
+
+    if not mark_order_paid(order_id, str(order["payment_reference"])):
+        await query.message.reply_text("Этот заказ уже оплачен. Спасибо!")
+        return
+
+    response = f"Спасибо! Оплата заказа №{order_id} подтверждена. Мы скоро свяжемся с вами."
+    await query.message.reply_text(response)
+    admin_chat_id = get_admin_chat_id()
+    if admin_chat_id is not None:
+        user = update.effective_user
+        user_info = f"{user.full_name or 'Без имени'} ({'@' + user.username if user.username else 'username не указан'})"
+        try:
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=f"Новый оплаченный заказ №{order_id}: {user_info}. Сумма: {format_ruble_amount(order['total_amount'])}.",
+            )
+        except Exception as error:
+            logging.exception("Не удалось отправить владельцу уведомление об оплате: %s", error)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -553,6 +729,8 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(add_to_cart_callback, pattern=f"^{re.escape(ADD_TO_CART_CALLBACK_PREFIX)}"))
     application.add_handler(CallbackQueryHandler(remove_cart_item_callback, pattern=f"^{re.escape(REMOVE_CART_ITEM_CALLBACK_PREFIX)}"))
     application.add_handler(CallbackQueryHandler(checkout_cart_callback, pattern=f"^{CHECKOUT_CALLBACK_DATA}$"))
+    application.add_handler(CallbackQueryHandler(pay_order_callback, pattern=f"^{re.escape(PAY_ORDER_CALLBACK_PREFIX)}"))
+    application.add_handler(CallbackQueryHandler(check_payment_callback, pattern=f"^{re.escape(CHECK_PAYMENT_CALLBACK_PREFIX)}"))
     application.add_handler(MessageHandler(filters.Regex(f"^({'|'.join(map(re.escape, REPLY_MENU_ACTIONS))})$"), reply_menu_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)

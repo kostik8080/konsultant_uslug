@@ -64,6 +64,7 @@ def initialize_database() -> None:
                 total_amount TEXT,
                 currency TEXT,
                 payment_reference TEXT,
+                payment_url TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
@@ -100,6 +101,9 @@ def initialize_database() -> None:
                 "ALTER TABLE dialog_messages ADD COLUMN include_in_context INTEGER NOT NULL DEFAULT 0 "
                 "CHECK (include_in_context IN (0, 1))"
             )
+        order_columns = {row["name"] for row in connection.execute("PRAGMA table_info(orders)")}
+        if "payment_url" not in order_columns:
+            connection.execute("ALTER TABLE orders ADD COLUMN payment_url TEXT")
 
 
 def upsert_user(telegram_user_id: int, username: str | None, full_name: str | None, started: bool = False) -> None:
@@ -254,6 +258,52 @@ def update_order_status(order_id: int, status: str, payment_reference: str | Non
             """,
             (status, payment_reference, _utc_now(), order_id),
         )
+
+
+def get_order(order_id: int, telegram_user_id: int) -> dict[str, object] | None:
+    """Return an order only when it belongs to the requesting Telegram user."""
+    with _connection() as connection:
+        row = connection.execute(
+            """
+            SELECT id, telegram_user_id, status, total_amount, currency, payment_reference, payment_url
+            FROM orders WHERE id = ? AND telegram_user_id = ?
+            """,
+            (order_id, telegram_user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_payment_session(order_id: int, payment_reference: str, payment_url: str) -> dict[str, object] | None:
+    """Store a Checkout Session once; return the order state that won a concurrent request."""
+    with _connection() as connection:
+        connection.execute(
+            """
+            UPDATE orders SET payment_reference = ?, payment_url = ?, updated_at = ?
+            WHERE id = ? AND payment_reference IS NULL AND status = 'ожидает оплаты'
+            """,
+            (payment_reference, payment_url, _utc_now(), order_id),
+        )
+        row = connection.execute(
+            """
+            SELECT id, telegram_user_id, status, total_amount, currency, payment_reference, payment_url
+            FROM orders WHERE id = ?
+            """,
+            (order_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def mark_order_paid(order_id: int, payment_reference: str) -> bool:
+    """Mark a pending order paid exactly once, returning whether its state changed."""
+    with _connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE orders SET status = 'оплачен', payment_reference = ?, updated_at = ?
+            WHERE id = ? AND status = 'ожидает оплаты'
+            """,
+            (payment_reference, _utc_now(), order_id),
+        )
+    return cursor.rowcount == 1
 
 
 def add_dialog_message(
